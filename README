@@ -1,0 +1,22 @@
+git-viz is an ASCII-art Git history visualizer. It's like git log --graph but
+better. The graph is larger and more visually intuitive.
+
+In a Git directory, run
+
+$ ./git-viz
+
+Or, provide a path to a Git directory:
+
+$ ./git-viz /path/to/git/stuff/
+
+By default, git-viz will display all reachable commits. You can limit the
+commits it displays (somewhat primitively for now) by passing arguments that
+will be passed straight through to git-rev-list after a '--'. For example, to
+display only the commits that are master or descendents of it:
+
+$ ./git-viz -- ^master^
+
+git-viz requires the flags --parents and --topo-order to work correctly, so it
+will always pass these to git-rev-list. If you provide flags that are
+incompatible with these (like --children or --date-order), git-viz will
+intercept them.

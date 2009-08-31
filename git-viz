@@ -1,0 +1,299 @@
+#!/usr/bin/env python
+
+import sys, os
+import subprocess
+from subprocess import Popen
+
+def color(name, bold=False):
+    _colors_dict = {'red' : 31, 'green' : 32, 'yellow' : 33, 'blue' : 34,
+        'magenta' : 35, 'cyan' : 36, 'white' : 37}
+    weight = ('1;' if bold else '0;')
+    return '\033[' + weight + str(_colors_dict[name]) + 'm'
+
+def normal():
+    return '\033[0m'
+
+
+class GitRepoException(Exception):
+    pass
+
+
+class Commit:
+    def __init__(self, repo, sha, parents):
+        self.repo = repo
+        self.sha = sha
+        self.parents = parents
+        self.children = []  # Will be computed later
+
+        subject_time = repo.command('log', ['--format=format:"%ct %s"',
+                                            '--no-walk', sha])
+        parts = subject_time.split(' ')
+        self.time = long(parts[0])
+        self.subject = ' '.join(parts[1:])
+
+    def is_child_of(self, commit):
+        return (commit in self.parents)
+
+    def render(self):
+        line = ''
+        if self.sha == self.repo.head:
+            line += color('yellow', True) + 'HEAD ' + normal()
+        if self.sha in self.repo.tags:
+            line += color('yellow') + ' '.join(self.repo.tags[self.sha]) + ' '
+        if self.sha in self.repo.branches:
+            line += color('red') + ' '.join(self.repo.branches[self.sha]) + ' '
+        if self.sha in self.repo.remotes:
+            line += color('blue') + ' '.join(self.repo.remotes[self.sha]) + ' '
+        return line + normal() + self.subject[0:80]
+
+
+class Repo:
+    def __init__(self, path):
+        # Situate ourselves
+        self.path = path
+        if not os.path.exists(path):
+            raise GitRepoException("not a git repo")
+        git_dir = self.command('rev-parse', ['--git-dir'])
+        if len(git_dir) == 0:
+            raise GitRepoException("not a git repo")
+        self.git_dir = os.path.abspath(os.path.join(path, git_dir))
+
+        # Get branches; figure out which SHAs correspond to branches
+        self.branches = {}
+        branches = self.command('branch').split("\n")
+        branches = [branch[2:] for branch in branches]
+        for branch in branches:
+            sha = self.command('rev-parse', [branch])
+            if not sha in self.branches: self.branches[sha] = []
+            self.branches[sha].append(branch)
+
+        # Do the same for tags
+        self.tags = {}
+        tags = self.command('tag')
+        # Have to check for this since there may be no tags. Don't do the check
+        # for branches because there had better be at least one branch
+        if len(tags) > 0:
+            tags = tags.split("\n")
+            for tag in tags:
+                sha = self.command('rev-parse', [tag])
+                if not sha in self.tags: self.tags[sha] = []
+                self.tags[sha].append(tag)
+
+        # And do the same for remotes
+        self.remotes = {}
+        remotes = self.command('branch', ['-r'])
+        if len(remotes) > 0:
+            remotes = remotes.split("\n")
+            for remote in remotes:
+                name = remote.strip().split(' ')[0]
+                sha = self.command('rev-parse', [name])
+                if not sha in self.remotes: self.remotes[sha] = []
+                self.remotes[sha].append(name)
+
+        self.head = self.command('rev-parse', ['HEAD'])
+        self.load()
+
+    def command(self, cmdname, args=[], indata=None):
+        cmdargs = ['git', cmdname] + args
+        p = Popen(' '.join(cmdargs), cwd=self.path, shell=True,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+        out = p.communicate(indata)
+        return out[0].rstrip()
+
+    def load(self):
+        global revlist_args
+
+        # Read in all the commits we want to graph. We need them topologically
+        # sorted to draw the graph correctly; let git do that for us.
+        all = self.command('rev-list', revlist_args).split("\n")
+
+        self.nodes = {}
+        self.commits = []
+        for commit in all:
+            fields = commit.split(' ')
+            node = Commit(self, fields[0], fields[1:])
+            self.nodes[fields[0]] = node
+            self.commits.append(fields[0])
+
+        # Now we compute children
+        for node in self.nodes:
+            parents = self.nodes[node].parents
+            for p in parents:
+                try:
+                    self.nodes[p].children.append(node)
+                except KeyError:
+                    # This is expected if we're limiting commits: eventually
+                    # there will be a commit whose listed parent wasn't read in
+                    pass
+
+    def branch_point(self, commit, tracks, child_indices):
+        line = ''
+
+        if len(child_indices) == 0:
+            tracks.append(commit)
+            return line
+        elif len(child_indices) == 1:
+            tracks[child_indices[0]] = commit
+            return line
+
+        # Now this is really a branch point
+        min = child_indices[0]
+        max = child_indices[-1]
+        line = '       ' + color('green', True)
+        for i in xrange(len(tracks)):
+            if i in child_indices:
+                if i == min:
+                    line += ' +'
+                else:
+                    line += '-+'
+            else:
+                if i < min or i > max:
+                    line += ' |'
+                else:
+                    line += '--'
+
+        # Calculate how far we're going to have to shift tracks over.
+        # distances[k] stores how many tracks to the right track k came from
+        distances = {}
+        count = 0
+        for i in xrange(len(tracks)):
+            if i in child_indices:
+                count += 1
+            elif count > 1:
+                distances[i - count + 1] = count - 1
+
+        # Reverse child_indices before iterating through them to delete from
+        # tracks because otherwise the indices we need to delete change, ha ha
+        prev_track_count = len(tracks)
+        child_indices.reverse()
+        for idx in child_indices:
+            del tracks[idx]
+        tracks.insert(min, commit)
+
+        line += "\n"
+        # Now we need to draw some connectors if there were any tracks to
+        # the right of the ones we merged. We need one line for all of the
+        # shift-by-one cases, and one line each for all the others.
+        multiple_connectors = []
+        one_connectors = []
+        for k in sorted(distances.iterkeys()):
+            if distances[k] == 1:
+                one_connectors.append(k)
+            else:
+                multiple_connectors.append(k)
+
+        if len(one_connectors) > 0:
+            line += '       '
+            line += ' '
+            for i in xrange(prev_track_count):
+                if i in one_connectors:
+                    line += ' /'
+                elif i in multiple_connectors:
+                    line += '  '
+                elif i in child_indices and i != min:
+                    line += '  '
+                elif i - 1 in one_connectors:
+                    line += '  '
+                else:
+                    line += '| '
+            line += "\n"
+        
+        for track in multiple_connectors:
+            line += '       '
+            line += ' '
+            for i in xrange(prev_track_count):
+                if i < track or i > track + distances[track]:
+                    line += '| '
+                elif i == track:
+                    line += '+-'
+                elif i == track + distances[track]:
+                    line += '+ '
+                else:
+                    line += '--'
+            line += "\n"
+        
+        line += '       ' + (' |' * len(tracks)) + "\n"
+        return line
+
+    def draw(self):
+        # Keep an array of "tracks", basically representing a vertical line
+        # through the diagram.
+        tracks = []
+
+        for commit in self.commits:
+            commit_obj = self.nodes[commit]
+
+            line = color('white', True)
+
+            # Find all the tracks of which this commit is a parent, merge them
+            # (note that despite the fact that I just said "merge", if there are
+            # multiple tracks of which this commit is a parent, this is a branch
+            # point) and slide everything to their right over.
+            child_indices = []
+            children = set()
+            for i in xrange(len(tracks)):
+                if tracks[i] in commit_obj.children and tracks[i] not in children:
+                    children.add(tracks[i])
+                    child_indices.append(i)
+            line += self.branch_point(commit, tracks, child_indices)
+
+            # By this point, exactly one entry in tracks should be equal to the
+            # current commit (part of what branch_point does).
+
+            # This commit may be a merge point, in which case we want to split
+            # the tracks. Confusing, yes. Put all the tracks added as a result
+            # of the merge all the way to the right, so as not to bother with
+            # shifting tracks over.
+            line += color('magenta') + commit[0:7] + color('green', True)
+            found = False
+            for i in xrange(len(tracks)):
+                if tracks[i] == commit:
+                    if len(commit_obj.parents) > 1:
+                        found = True
+                    line += ' O'
+                else:
+                    if found:
+                        line += '--'
+                    else:
+                        line += ' |'
+            line += '-+' * (len(commit_obj.parents) - 1)
+            for i in xrange(len(commit_obj.parents) - 1):
+                tracks.append(commit)
+
+            line += normal()
+            line += ' ' + commit_obj.render()
+            print line
+            if commit != self.commits[-1]:
+                print color('green', True) + "       " + (" |" * len(tracks)) + normal()
+
+revlist_args = []
+
+def main():
+    global revlist_args
+    try:
+        if len(sys.argv) > 1 and not sys.argv[1].startswith('--'):
+            path = sys.argv[1]
+            del sys.argv[1]
+        else:
+            path = '.'
+
+        if len(sys.argv) > 1 and sys.argv[1] == '--':
+            revlist_args = sys.argv[2:]
+        if '--date-order' in revlist_args:
+            revlist_args.remove('--date-order')
+        if '--children' in revlist_args:
+            revlist_args.remove('--children')
+        revlist_args.insert(0, '--all')
+        revlist_args.insert(0, '--topo-order')
+        revlist_args.insert(0, '--parents')
+
+        repo = Repo(path)
+        repo.draw()
+    except GitRepoException:
+        print "Error: could not find Git repository."
+        print "Run from a Git work tree or repository, or run as"
+        print "    %s <path>" % sys.argv[0]
+        sys.exit(1)
+
+main()
